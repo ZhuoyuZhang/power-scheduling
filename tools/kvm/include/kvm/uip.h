@@ -205,6 +205,7 @@ struct uip_info {
 	u32 dns_ip[UIP_DHCP_MAX_DNS_SERVER_NR];
 	char *domain_name;
 	u32 buf_nr;
+	u32 vnet_hdr_len;
 };
 
 struct uip_buf {
@@ -213,8 +214,8 @@ struct uip_buf {
 	int vnet_len;
 	int eth_len;
 	int status;
-	char *vnet;
-	char *eth;
+	unsigned char *vnet;
+	unsigned char *eth;
 	int id;
 };
 
@@ -252,7 +253,7 @@ struct uip_tcp_socket {
 };
 
 struct uip_tx_arg {
-	struct virtio_net_hdr *vnet;
+	void *vnet;
 	struct uip_info *info;
 	struct uip_eth *eth;
 	int vnet_len;

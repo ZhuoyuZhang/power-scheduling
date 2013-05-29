@@ -8,6 +8,7 @@
 #include "kvm/irq.h"
 #include "kvm/uip.h"
 #include "kvm/guest_compat.h"
+#include "kvm/iovec.h"
 
 #include <linux/vhost.h>
 #include <linux/virtio_net.h>
@@ -58,10 +59,19 @@ struct net_dev {
 	struct uip_info			info;
 	struct net_dev_operations	*ops;
 	struct kvm			*kvm;
+
+	struct virtio_net_params	*params;
 };
 
 static LIST_HEAD(ndevs);
 static int compat_id = -1;
+
+#define MAX_PACKET_SIZE 65550
+
+static bool has_virtio_feature(struct net_dev *ndev, u32 feature)
+{
+	return ndev->features & (1 << feature);
+}
 
 static void *virtio_net_rx_thread(void *p)
 {
@@ -71,7 +81,7 @@ static void *virtio_net_rx_thread(void *p)
 	struct net_dev *ndev = p;
 	u16 out, in;
 	u16 head;
-	int len;
+	size_t len, copied;
 	u32 id;
 
 	mutex_lock(&ndev->mutex);
@@ -90,10 +100,31 @@ static void *virtio_net_rx_thread(void *p)
 		mutex_unlock(&ndev->io_lock[id]);
 
 		while (virt_queue__available(vq)) {
-			head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
-			len = ndev->ops->rx(iov, in, ndev);
-			virt_queue__set_used_elem(vq, head, len);
+			unsigned char buffer[MAX_PACKET_SIZE + sizeof(struct virtio_net_hdr_mrg_rxbuf)];
+			struct iovec dummy_iov = {
+				.iov_base = buffer,
+				.iov_len  = sizeof(buffer),
+			};
+			struct virtio_net_hdr_mrg_rxbuf *hdr;
 
+			len = ndev->ops->rx(&dummy_iov, 1, ndev);
+			copied = 0;
+			head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
+			hdr = (void *)iov[0].iov_base;
+			while (copied < len) {
+				size_t iovsize = min(len - copied, iov_size(iov, in));
+
+				memcpy_toiovecend(iov, buffer, copied, iovsize);
+				copied += iovsize;
+				if (has_virtio_feature(ndev, VIRTIO_NET_F_MRG_RXBUF))
+					hdr->num_buffers++;
+				virt_queue__set_used_elem(vq, head, iovsize);
+				if (copied == len)
+					break;
+				while (!virt_queue__available(vq))
+					sleep(0);
+				head = virt_queue__get_iov(vq, iov, &out, &in, kvm);
+			}
 			/* We should interrupt guest right now, otherwise latency is huge. */
 			if (virtio_queue__should_signal(vq))
 				ndev->vdev.ops->signal_vq(kvm, &ndev->vdev, id);
@@ -207,13 +238,13 @@ static void virtio_net_handle_callback(struct kvm *kvm, struct net_dev *ndev, in
 	mutex_unlock(&ndev->io_lock[queue]);
 }
 
-static bool virtio_net__tap_init(const struct virtio_net_params *params,
-					struct net_dev *ndev)
+static bool virtio_net__tap_init(struct net_dev *ndev)
 {
 	int sock = socket(AF_INET, SOCK_STREAM, 0);
 	int pid, status, offload, hdr_len;
 	struct sockaddr_in sin = {0};
 	struct ifreq ifr;
+	const struct virtio_net_params *params = ndev->params;
 
 	/* Did the user already gave us the FD? */
 	if (params->fd) {
@@ -241,7 +272,9 @@ static bool virtio_net__tap_init(const struct virtio_net_params *params,
 		goto fail;
 	}
 
-	hdr_len = sizeof(struct virtio_net_hdr);
+	hdr_len = has_virtio_feature(ndev, VIRTIO_NET_F_MRG_RXBUF) ?
+			sizeof(struct virtio_net_hdr_mrg_rxbuf) :
+			sizeof(struct virtio_net_hdr);
 	if (ioctl(ndev->tap_fd, TUNSETVNETHDRSZ, &hdr_len) < 0)
 		pr_warning("Config tap device TUNSETVNETHDRSZ error");
 
@@ -347,6 +380,7 @@ static u32 get_host_features(struct kvm *kvm, void *dev)
 		| 1UL << VIRTIO_RING_F_EVENT_IDX
 		| 1UL << VIRTIO_RING_F_INDIRECT_DESC
 		| 1UL << VIRTIO_NET_F_CTRL_VQ
+		| 1UL << VIRTIO_NET_F_MRG_RXBUF
 		| 1UL << (ndev->queue_pairs > 1 ? VIRTIO_NET_F_MQ : 0);
 }
 
@@ -355,6 +389,11 @@ static void set_guest_features(struct kvm *kvm, void *dev, u32 features)
 	struct net_dev *ndev = dev;
 
 	ndev->features = features;
+}
+
+static bool is_ctrl_vq(struct net_dev *ndev, u32 vq)
+{
+	return vq == (u32)(ndev->queue_pairs * 2);
 }
 
 static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
@@ -377,10 +416,12 @@ static int init_vq(struct kvm *kvm, void *dev, u32 vq, u32 page_size, u32 align,
 
 	mutex_init(&ndev->io_lock[vq]);
 	pthread_cond_init(&ndev->io_cond[vq], NULL);
-	if (ndev->vhost_fd == 0) {
-		if (vq == (u32)(ndev->queue_pairs * 2))
-			pthread_create(&ndev->io_thread[vq], NULL, virtio_net_ctrl_thread, ndev);
-		else if (vq & 1)
+	if (is_ctrl_vq(ndev, vq)) {
+		pthread_create(&ndev->io_thread[vq], NULL, virtio_net_ctrl_thread, ndev);
+
+		return 0;
+	} else if (ndev->vhost_fd == 0 ) {
+		if (vq & 1)
 			pthread_create(&ndev->io_thread[vq], NULL, virtio_net_tx_thread, ndev);
 		else
 			pthread_create(&ndev->io_thread[vq], NULL, virtio_net_rx_thread, ndev);
@@ -453,7 +494,7 @@ static void notify_vq_eventfd(struct kvm *kvm, void *dev, u32 vq, u32 efd)
 	};
 	int r;
 
-	if (ndev->vhost_fd == 0)
+	if (ndev->vhost_fd == 0 || is_ctrl_vq(ndev, vq))
 		return;
 
 	r = ioctl(ndev->vhost_fd, VHOST_SET_VRING_KICK, &file);
@@ -489,6 +530,8 @@ static int set_size_vq(struct kvm *kvm, void *dev, u32 vq, int size)
 	return size;
 }
 
+static void notify_status(struct kvm *kvm, void *dev, u8 status);
+
 static struct virtio_ops net_dev_virtio_ops = (struct virtio_ops) {
 	.get_config		= get_config,
 	.get_host_features	= get_host_features,
@@ -500,6 +543,7 @@ static struct virtio_ops net_dev_virtio_ops = (struct virtio_ops) {
 	.notify_vq		= notify_vq,
 	.notify_vq_gsi		= notify_vq_gsi,
 	.notify_vq_eventfd	= notify_vq_eventfd,
+	.notify_status		= notify_status,
 };
 
 static void virtio_net__vhost_init(struct kvm *kvm, struct net_dev *ndev)
@@ -645,6 +689,7 @@ static int virtio_net__init_one(struct virtio_net_params *params)
 	list_add_tail(&ndev->list, &ndevs);
 
 	ndev->kvm = params->kvm;
+	ndev->params = params;
 
 	mutex_init(&ndev->mutex);
 	ndev->queue_pairs = max(1, min(VIRTIO_NET_NUM_QUEUES, params->mq));
@@ -660,15 +705,12 @@ static int virtio_net__init_one(struct virtio_net_params *params)
 
 	ndev->mode = params->mode;
 	if (ndev->mode == NET_MODE_TAP) {
-		if (!virtio_net__tap_init(params, ndev))
-			die_perror("You have requested a TAP device, but creation of one has failed because");
 		ndev->ops = &tap_ops;
 	} else {
 		ndev->info.host_ip		= ntohl(inet_addr(params->host_ip));
 		ndev->info.guest_ip		= ntohl(inet_addr(params->guest_ip));
 		ndev->info.guest_netmask	= ntohl(inet_addr("255.255.255.0"));
 		ndev->info.buf_nr		= 20,
-		uip_init(&ndev->info);
 		ndev->ops = &uip_ops;
 	}
 
@@ -688,6 +730,24 @@ static int virtio_net__init_one(struct virtio_net_params *params)
 	return 0;
 }
 
+static void notify_status(struct kvm *kvm, void *dev, u8 status)
+{
+	struct net_dev *ndev = dev;
+
+	if (!(status & VIRTIO_CONFIG_S_DRIVER_OK))
+		return;
+
+	if (ndev->mode == NET_MODE_TAP) {
+		if (!virtio_net__tap_init(ndev))
+			die_perror("You have requested a TAP device, but creation of one has failed because");
+	} else {
+		ndev->info.vnet_hdr_len = has_virtio_feature(ndev, VIRTIO_NET_F_MRG_RXBUF) ?
+						sizeof(struct virtio_net_hdr_mrg_rxbuf) :
+						sizeof(struct virtio_net_hdr);
+		uip_init(&ndev->info);
+	}
+}
+
 int virtio_net__init(struct kvm *kvm)
 {
 	int i;
@@ -698,7 +758,7 @@ int virtio_net__init(struct kvm *kvm)
 	}
 
 	if (kvm->cfg.num_net_devices == 0 && kvm->cfg.no_net == 0) {
-		struct virtio_net_params net_params;
+		static struct virtio_net_params net_params;
 
 		net_params = (struct virtio_net_params) {
 			.guest_ip	= kvm->cfg.guest_ip,
